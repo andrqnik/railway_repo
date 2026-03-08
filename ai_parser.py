@@ -1,10 +1,28 @@
 import json
 import re
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 import anthropic
 
 logger = logging.getLogger(__name__)
+
+WEEKDAY_RU = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"]
+MONTHS_RU = ["января", "февраля", "марта", "апреля", "мая", "июня",
+             "июля", "августа", "сентября", "октября", "ноября", "декабря"]
+
+
+def _format_date_ru(dt: datetime) -> str:
+    return f"{dt.day} {MONTHS_RU[dt.month - 1]} {dt.year}"
+
+
+def _build_week_calendar(today: datetime) -> str:
+    """Build an explicit calendar of the next 14 days so Claude never guesses."""
+    lines = []
+    for i in range(14):
+        day = today + timedelta(days=i)
+        label = "сегодня" if i == 0 else ("завтра" if i == 1 else WEEKDAY_RU[day.weekday()])
+        lines.append(f"  {label} = {day.strftime('%Y-%m-%d')} ({_format_date_ru(day)})")
+    return "\n".join(lines)
 
 
 class AIParser:
@@ -16,11 +34,12 @@ class AIParser:
     async def parse(self, text: str) -> dict:
         today = datetime.now()
         today_str = today.strftime("%Y-%m-%d")
-        today_weekday = today.strftime("%A")  # e.g. "Sunday"
+        calendar = _build_week_calendar(today)
 
         prompt = f"""You are a task parser for a Russian-speaking user. Extract task information from the text below.
 
-Today is {today_str} ({today_weekday}).
+Today is {today_str}. Use this exact calendar for ALL date calculations — never guess:
+{calendar}
 
 Task text: "{text}"
 
@@ -32,11 +51,11 @@ Return ONLY a valid JSON object with these fields:
 - "priority": 1=срочно/urgent, 2=высокий/high, 3=обычный/normal, 4=низкий/low (integer, default 3)
 
 Rules:
-- For relative dates ("до пятницы", "к концу недели", "завтра") calculate from today {today_str}
-- "до конца недели" means the upcoming Sunday
+- Use ONLY the dates from the calendar above — do not calculate dates yourself
+- "до конца недели" / "к концу недели" = ближайшее воскресенье из календаря
+- "на следующей неделе" = следующий понедельник из календаря
 - If no deadline is mentioned, use null for due_date and due_date_formatted
 - Keep the name short and clear — it's the task title
-- If extra details exist, put them in description
 - Return ONLY the JSON object — no markdown fences, no explanation"""
 
         message = await self.client.messages.create(
