@@ -1,0 +1,69 @@
+import json
+import re
+import logging
+from datetime import datetime
+import anthropic
+
+logger = logging.getLogger(__name__)
+
+
+class AIParser:
+    """Parses free-form task descriptions using Claude AI."""
+
+    def __init__(self, api_key: str):
+        self.client = anthropic.AsyncAnthropic(api_key=api_key)
+
+    async def parse(self, text: str) -> dict:
+        today = datetime.now()
+        today_str = today.strftime("%Y-%m-%d")
+        today_weekday = today.strftime("%A")  # e.g. "Sunday"
+
+        prompt = f"""You are a task parser for a Russian-speaking user. Extract task information from the text below.
+
+Today is {today_str} ({today_weekday}).
+
+Task text: "{text}"
+
+Return ONLY a valid JSON object with these fields:
+- "name": concise task title in Russian (string, max 100 chars, required)
+- "description": additional context or details (string, empty string if none)
+- "due_date": deadline as Unix timestamp in MILLISECONDS (integer or null if no deadline mentioned)
+- "due_date_formatted": human-readable date in Russian like "15 марта 2026" (string or null)
+- "priority": 1=срочно/urgent, 2=высокий/high, 3=обычный/normal, 4=низкий/low (integer, default 3)
+
+Rules:
+- For relative dates ("до пятницы", "к концу недели", "завтра") calculate from today {today_str}
+- "до конца недели" means the upcoming Sunday
+- If no deadline is mentioned, use null for due_date and due_date_formatted
+- Keep the name short and clear — it's the task title
+- If extra details exist, put them in description
+- Return ONLY the JSON object — no markdown fences, no explanation"""
+
+        message = await self.client.messages.create(
+            model="claude-opus-4-6",
+            max_tokens=512,
+            messages=[{"role": "user", "content": prompt}],
+        )
+
+        response_text = message.content[0].text.strip()
+        logger.debug(f"AI response: {response_text}")
+
+        # Strip markdown code blocks if present
+        if "```" in response_text:
+            match = re.search(r"```(?:json)?\s*(.*?)```", response_text, re.DOTALL)
+            if match:
+                response_text = match.group(1).strip()
+
+        task_data = json.loads(response_text)
+
+        # Ensure required fields have safe defaults
+        task_data.setdefault("name", text[:100])
+        task_data.setdefault("description", "")
+        task_data.setdefault("due_date", None)
+        task_data.setdefault("due_date_formatted", None)
+        task_data.setdefault("priority", 3)
+
+        # Clamp priority to valid range
+        task_data["priority"] = max(1, min(4, int(task_data["priority"])))
+
+        return task_data
