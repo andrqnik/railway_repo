@@ -46,15 +46,14 @@ Task text: "{text}"
 Return ONLY a valid JSON object with these fields:
 - "name": concise task title in Russian (string, max 100 chars, required)
 - "description": additional context or details (string, empty string if none)
-- "due_date": deadline as Unix timestamp in MILLISECONDS (integer or null if no deadline mentioned)
-- "due_date_formatted": human-readable date in Russian like "15 марта 2026" (string or null)
+- "due_date_str": deadline as a date string in YYYY-MM-DD format taken directly from the calendar above (string or null if no deadline mentioned)
 - "priority": 1=срочно/urgent, 2=высокий/high, 3=обычный/normal, 4=низкий/low (integer, default 3)
 
 Rules:
-- Use ONLY the dates from the calendar above — do not calculate dates yourself
+- For due_date_str copy the YYYY-MM-DD value EXACTLY from the calendar above — do not calculate or invent dates
 - "до конца недели" / "к концу недели" = ближайшее воскресенье из календаря
 - "на следующей неделе" = следующий понедельник из календаря
-- If no deadline is mentioned, use null for due_date and due_date_formatted
+- If no deadline is mentioned, set due_date_str to null
 - Keep the name short and clear — it's the task title
 - Return ONLY the JSON object — no markdown fences, no explanation"""
 
@@ -78,9 +77,23 @@ Rules:
         # Ensure required fields have safe defaults
         task_data.setdefault("name", text[:100])
         task_data.setdefault("description", "")
-        task_data.setdefault("due_date", None)
-        task_data.setdefault("due_date_formatted", None)
+        task_data.setdefault("due_date_str", None)
         task_data.setdefault("priority", 3)
+
+        # Convert YYYY-MM-DD string → Unix timestamp in ms (Python does this, not Claude)
+        due_date_str = task_data.pop("due_date_str", None)
+        if due_date_str:
+            try:
+                dt = datetime.strptime(due_date_str, "%Y-%m-%d")
+                task_data["due_date"] = int(dt.timestamp() * 1000)
+                task_data["due_date_formatted"] = _format_date_ru(dt)
+            except ValueError:
+                logger.warning(f"Could not parse date string: {due_date_str}")
+                task_data["due_date"] = None
+                task_data["due_date_formatted"] = None
+        else:
+            task_data["due_date"] = None
+            task_data["due_date_formatted"] = None
 
         # Clamp priority to valid range
         task_data["priority"] = max(1, min(4, int(task_data["priority"])))
