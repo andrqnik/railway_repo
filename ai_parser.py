@@ -58,7 +58,7 @@ Rules:
 - Return ONLY the JSON object — no markdown fences, no explanation"""
 
         message = await self.client.messages.create(
-            model="claude-opus-4-6",
+            model="claude-sonnet-4-6",
             max_tokens=512,
             messages=[{"role": "user", "content": prompt}],
         )

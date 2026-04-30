@@ -25,8 +25,9 @@ class ClickUpClient:
         task_data: dict,
         file_content: bytes = None,
         file_name: str = None,
+        tags: list = None,
     ) -> dict:
-        """Create a task in ClickUp and optionally attach a file."""
+        """Create a task in ClickUp, optionally with tags and an attached file."""
         payload = {
             "name": task_data["name"],
             "description": task_data.get("description", ""),
@@ -38,15 +39,18 @@ class ClickUpClient:
             payload["due_date"] = int(task_data["due_date"])
             payload["due_date_time"] = True
 
+        if tags:
+            # ClickUp accepts tag names; tag must already exist in the Space.
+            payload["tags"] = tags
+
         async with aiohttp.ClientSession() as session:
             task = await self._create_task_request(session, payload)
 
-            # Upload file attachment if provided
+            # Upload file attachment if provided (best-effort: don't fail if attach errors)
             if file_content and file_name and task.get("id"):
                 try:
                     await self._upload_attachment(session, task["id"], file_content, file_name)
                 except Exception as e:
-                    # Don't fail the whole operation if attachment upload fails
                     logger.warning(f"File attachment failed (task was still created): {e}")
 
         return task
@@ -60,7 +64,6 @@ class ClickUpClient:
             if resp.status not in (200, 201):
                 logger.error(f"ClickUp create task error {resp.status}: {response_text}")
 
-                # Give user a human-readable error
                 if resp.status == 401:
                     raise Exception("Неверный ClickUp API ключ (401 Unauthorized). Проверьте CLICKUP_API_KEY.")
                 elif resp.status == 404:
