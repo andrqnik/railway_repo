@@ -33,8 +33,6 @@ PRIORITY_LABELS = {
     4: "🔵 Низкий",
 }
 
-INBOX_TAG = "inbox-deferred"
-
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_html(
@@ -59,9 +57,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "3. Выбери: 📥 В инбокс (отложить) или ✅ Разобрать (создать сейчас)\n"
         "4. Можно прикрепить файл — попадёт в задачу\n\n"
         "<b>Что делает каждая кнопка:</b>\n"
-        "• 📥 <b>В инбокс</b> → задача создаётся с тегом <code>inbox-deferred</code>, "
-        "разберём вместе утром\n"
-        "• ✅ <b>Разобрать</b> → задача создаётся сразу, без тега\n\n"
+        "• 📥 <b>В инбокс</b> → отложить, разберём вместе утром\n"
+        "• ✅ <b>Разобрать</b> → создать задачу сразу\n\n"
         "<b>Примеры:</b>\n"
         "• <code>Подготовить договор с ООО Ромашка, дедлайн 25 марта, приоритет высокий</code>\n"
         "• <code>Срочно позвонить в банк насчёт счёта</code>\n\n"
@@ -179,10 +176,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         if action == "defer":
-            tags = [INBOX_TAG]
             header = "📥 <b>Сохранил в инбокс. Разберём утром.</b>\n"
         elif action == "now":
-            tags = None
             header = "✅ <b>Задача создана.</b>\n"
         else:
             await query.edit_message_text("⚠ Неизвестное действие.")
@@ -192,7 +187,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             task_data=task_data,
             file_content=file_content,
             file_name=file_name,
-            tags=tags,
         )
 
         lines = [header]
