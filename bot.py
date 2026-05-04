@@ -15,6 +15,7 @@ from telegram.ext import (
 from config import Config
 from ai_parser import AIParser
 from clickup_client import ClickUpClient
+from whisper_client import WhisperClient
 
 load_dotenv()
 
@@ -27,6 +28,7 @@ logger = logging.getLogger(__name__)
 config = Config()
 ai_parser = AIParser(config.anthropic_api_key)
 clickup = ClickUpClient(config.clickup_api_key, config.clickup_list_id)
+whisper = WhisperClient(config.openai_api_key) if config.openai_api_key else None
 
 DUBAI_TZ = ZoneInfo("Asia/Dubai")
 
@@ -55,13 +57,16 @@ def _format_date_short(dt: datetime) -> str:
 
 
 def _escape(text: str) -> str:
-    """Escape HTML special characters."""
     return (
         str(text)
         .replace("&", "&amp;")
         .replace("<", "&lt;")
         .replace(">", "&gt;")
     )
+
+
+def _truncate(text: str, limit: int = 200) -> str:
+    return text if len(text) <= limit else text[:limit] + "..."
 
 
 def _format_inbox_list(tasks: list, header: str) -> str:
@@ -88,7 +93,7 @@ def _format_inbox_list(tasks: list, header: str) -> str:
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_html(
         "👋 <b>Привет!</b> Я разбираю твои сообщения и помогаю с задачами в ClickUp.\n\n"
-        "Просто напиши задачу в свободной форме — я разберу и предложу:\n"
+        "Напиши задачу текстом, пришли голосовое или прикрепи файл — я разберу и предложу:\n"
         "📥 <b>В инбокс</b> — отложить, разберём вместе утром\n"
         "✅ <b>Разобрать</b> — создать задачу прямо сейчас\n\n"
         "Каждое утро в 10:00 (Дубай) пришлю список того что в инбоксе.\n\n"
@@ -99,15 +104,16 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    voice_status = "✅ работают" if whisper else "⚠ не настроены (нужен OPENAI_API_KEY)"
     await update.message.reply_html(
         "<b>Как пользоваться:</b>\n\n"
-        "1. Напиши задачу в свободной форме\n"
+        "1. Напиши задачу текстом, пришли голосовое или приложи файл\n"
         "2. Я разберу — покажу превью с дедлайном и приоритетом\n"
-        "3. Выбери: 📥 В инбокс (отложить) или ✅ Разобрать (создать сейчас)\n"
-        "4. Можно прикрепить файл — попадёт в задачу\n\n"
+        "3. Выбери: 📥 В инбокс (отложить) или ✅ Разобрать (создать сейчас)\n\n"
+        f"<b>Голосовые:</b> {voice_status}\n\n"
         "<b>Команды:</b>\n"
         "/inbox — показать что не разобрано\n"
-        "/myid — узнать свой chat_id (для настройки утренних дайджестов)\n"
+        "/myid — узнать свой chat_id (для утренних дайджестов)\n"
         "/test_morning — проверить утренний дайджест прямо сейчас\n\n"
         "<b>Утренний дайджест:</b>\n"
         "Каждый день в 10:00 по Дубаю присылаю список того что в инбоксе. "
@@ -119,7 +125,6 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def inbox_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show current inbox tasks on demand."""
     msg = await update.message.reply_text("⏳ Забираю инбокс из ClickUp...")
     try:
         tasks = await clickup.get_inbox_tasks()
@@ -136,7 +141,6 @@ async def inbox_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def myid_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Returns the user's chat_id — needed once to enable proactive morning digests."""
     chat_id = update.effective_chat.id
     await update.message.reply_html(
         f"Твой <b>chat_id</b>: <code>{chat_id}</code>\n\n"
@@ -149,7 +153,6 @@ async def myid_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def morning_inbox_digest(context: ContextTypes.DEFAULT_TYPE):
-    """Daily 10:00 Asia/Dubai — push inbox if non-empty. Silent on empty days."""
     if not config.telegram_user_chat_id:
         logger.warning("TELEGRAM_USER_CHAT_ID not set — skipping morning digest")
         return
@@ -174,7 +177,6 @@ async def morning_inbox_digest(context: ContextTypes.DEFAULT_TYPE):
 
 
 async def test_morning_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Run the morning digest right now (for testing without waiting until 10:00)."""
     if not config.telegram_user_chat_id:
         await update.message.reply_html(
             "⚠ Сначала добавь <code>TELEGRAM_USER_CHAT_ID</code> в Railway Variables.\n"
@@ -185,22 +187,77 @@ async def test_morning_command(update: Update, context: ContextTypes.DEFAULT_TYP
     await morning_inbox_digest(context)
 
 
+async def _show_task_preview(
+    message,
+    context: ContextTypes.DEFAULT_TYPE,
+    text: str,
+    status_msg,
+    voice_transcript: str = None,
+    file_content: bytes = None,
+    file_name: str = None,
+):
+    """Common pipeline: parse text → cache → show preview with defer/decide buttons."""
+    task_data = await ai_parser.parse(text)
+
+    cache_key = f"task_{message.message_id}"
+    context.user_data[cache_key] = {
+        "task_data": task_data,
+        "file_content": file_content,
+        "file_name": file_name,
+    }
+
+    lines = []
+    if voice_transcript:
+        lines.append(f"🎙 <i>«{_escape(_truncate(voice_transcript))}»</i>\n")
+    lines.append("📝 <b>Распознал:</b>\n")
+    lines.append(f"📌 <b>{_escape(task_data['name'])}</b>")
+
+    if task_data.get("due_date_formatted"):
+        lines.append(f"📅 {_escape(task_data['due_date_formatted'])}")
+
+    priority = task_data.get("priority", 3)
+    lines.append(f"⚡ {PRIORITY_LABELS.get(priority, '🟡 Обычный')}")
+
+    if task_data.get("description"):
+        desc = task_data["description"]
+        if len(desc) > 120:
+            desc = desc[:120] + "..."
+        lines.append(f"\n{_escape(desc)}")
+
+    if file_name:
+        lines.append(f"\n📎 {_escape(file_name)}")
+
+    lines.append("\n<i>Пока ничего не создано. Что делаем?</i>")
+
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("📥 В инбокс", callback_data=f"defer:{message.message_id}"),
+            InlineKeyboardButton("✅ Разобрать", callback_data=f"now:{message.message_id}"),
+        ]
+    ])
+
+    await status_msg.edit_text(
+        "\n".join(lines),
+        parse_mode="HTML",
+        reply_markup=keyboard,
+    )
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Text messages, optionally with document/photo attachment."""
     message = update.message
     text = message.text or message.caption or ""
 
     if not text.strip():
         await message.reply_text(
             "📝 Пожалуйста, напиши описание задачи.\n"
-            "Можно отправить текст вместе с файлом или просто текст."
+            "Или пришли голосовое — я его расшифрую."
         )
         return
 
     status_msg = await message.reply_text("⏳ Разбираю задачу...")
 
     try:
-        task_data = await ai_parser.parse(text)
-
         file_content = None
         file_name = None
 
@@ -214,44 +271,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             file_content = bytes(await file.download_as_bytearray())
             file_name = f"photo_{photo.file_id}.jpg"
 
-        cache_key = f"task_{message.message_id}"
-        context.user_data[cache_key] = {
-            "task_data": task_data,
-            "file_content": file_content,
-            "file_name": file_name,
-        }
-
-        lines = ["📝 <b>Распознал:</b>\n"]
-        lines.append(f"📌 <b>{_escape(task_data['name'])}</b>")
-
-        if task_data.get("due_date_formatted"):
-            lines.append(f"📅 {_escape(task_data['due_date_formatted'])}")
-
-        priority = task_data.get("priority", 3)
-        lines.append(f"⚡ {PRIORITY_LABELS.get(priority, '🟡 Обычный')}")
-
-        if task_data.get("description"):
-            desc = task_data["description"]
-            if len(desc) > 120:
-                desc = desc[:120] + "..."
-            lines.append(f"\n{_escape(desc)}")
-
-        if file_name:
-            lines.append(f"\n📎 {_escape(file_name)}")
-
-        lines.append("\n<i>Пока ничего не создано. Что делаем?</i>")
-
-        keyboard = InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton("📥 В инбокс", callback_data=f"defer:{message.message_id}"),
-                InlineKeyboardButton("✅ Разобрать", callback_data=f"now:{message.message_id}"),
-            ]
-        ])
-
-        await status_msg.edit_text(
-            "\n".join(lines),
-            parse_mode="HTML",
-            reply_markup=keyboard,
+        await _show_task_preview(
+            message, context, text, status_msg,
+            file_content=file_content,
+            file_name=file_name,
         )
 
     except Exception as e:
@@ -260,6 +283,54 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"❌ Не удалось разобрать задачу.\n\n"
             f"Ошибка: {str(e)}\n\n"
             f"Попробуй сформулировать иначе."
+        )
+
+
+async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Voice/audio messages — transcribe via Whisper, then run the same flow as text."""
+    message = update.message
+
+    if not whisper:
+        await message.reply_html(
+            "🎙 Голосовые пока не настроены.\n"
+            "Добавь <code>OPENAI_API_KEY</code> в Railway Variables — взять можно "
+            "на <a href=\"https://platform.openai.com/api-keys\">platform.openai.com/api-keys</a>."
+        )
+        return
+
+    status_msg = await message.reply_text("🎙 Слушаю голосовое...")
+
+    try:
+        voice_obj = message.voice or message.audio
+        file = await voice_obj.get_file()
+        audio_bytes = bytes(await file.download_as_bytearray())
+
+        await status_msg.edit_text("🎙 Транскрибирую через Whisper...")
+
+        text = await whisper.transcribe(audio_bytes, file_name="voice.ogg")
+
+        if not text.strip():
+            await status_msg.edit_text(
+                "🎙 Не получилось разобрать — пустая транскрипция.\n"
+                "Попробуй ещё раз чуть чётче."
+            )
+            return
+
+        await status_msg.edit_text(
+            f"🎙 <i>«{_escape(_truncate(text))}»</i>\n\n⏳ Разбираю задачу...",
+            parse_mode="HTML",
+        )
+
+        await _show_task_preview(
+            message, context, text, status_msg,
+            voice_transcript=text,
+        )
+
+    except Exception as e:
+        logger.error(f"Voice handling error: {e}", exc_info=True)
+        await status_msg.edit_text(
+            f"❌ Не удалось обработать голосовое.\n\n"
+            f"Ошибка: {str(e)}"
         )
 
 
@@ -344,22 +415,28 @@ def main():
     app.add_handler(CommandHandler("inbox", inbox_command))
     app.add_handler(CommandHandler("myid", myid_command))
     app.add_handler(CommandHandler("test_morning", test_morning_command))
+
+    # Voice & audio go to dedicated handler
+    app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice))
+
+    # Text + document/photo — main capture flow
     app.add_handler(
         MessageHandler(
             (filters.TEXT | filters.Document.ALL | filters.PHOTO) & ~filters.COMMAND,
             handle_message,
         )
     )
+
     app.add_handler(CallbackQueryHandler(handle_callback))
 
-    # Schedule morning digest at 10:00 Asia/Dubai
     app.job_queue.run_daily(
         morning_inbox_digest,
         time=dt_time(hour=10, minute=0, tzinfo=DUBAI_TZ),
         name="morning_inbox_digest",
     )
 
-    logger.info("Bot is running... morning digest scheduled at 10:00 Asia/Dubai")
+    voice_status = "ON (Whisper)" if whisper else "OFF (no OPENAI_API_KEY)"
+    logger.info(f"Bot is running... morning digest at 10:00 Asia/Dubai · voice: {voice_status}")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 

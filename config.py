@@ -11,8 +11,11 @@ class Config:
         self.clickup_api_key = os.environ.get("CLICKUP_API_KEY", "")
         self.clickup_list_id = os.environ.get("CLICKUP_LIST_ID", "")
 
-        # Optional — needed only for proactive morning digest
+        # Optional — proactive morning digest
         self.telegram_user_chat_id = os.environ.get("TELEGRAM_USER_CHAT_ID", "")
+
+        # Optional — voice transcription via Whisper
+        self.openai_api_key = os.environ.get("OPENAI_API_KEY", "")
 
         missing = [
             name
