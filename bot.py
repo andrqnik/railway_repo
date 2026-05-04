@@ -91,7 +91,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Просто напиши задачу в свободной форме — я разберу и предложу:\n"
         "📥 <b>В инбокс</b> — отложить, разберём вместе утром\n"
         "✅ <b>Разобрать</b> — создать задачу прямо сейчас\n\n"
-        "Каждое утро в 8:15 (Дубай) пришлю список того что в инбоксе.\n\n"
+        "Каждое утро в 10:00 (Дубай) пришлю список того что в инбоксе.\n\n"
         "<b>Команды:</b>\n"
         "/inbox — показать инбокс прямо сейчас\n"
         "/help — подробная справка"
@@ -110,7 +110,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/myid — узнать свой chat_id (для настройки утренних дайджестов)\n"
         "/test_morning — проверить утренний дайджест прямо сейчас\n\n"
         "<b>Утренний дайджест:</b>\n"
-        "Каждый день в 8:15 по Дубаю присылаю список того что в инбоксе. "
+        "Каждый день в 10:00 по Дубаю присылаю список того что в инбоксе. "
         "Если инбокс пустой — молчу.\n\n"
         "<b>Примеры задач:</b>\n"
         "• <code>Подготовить договор с ООО Ромашка, дедлайн 25 марта, приоритет высокий</code>\n"
@@ -149,7 +149,7 @@ async def myid_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def morning_inbox_digest(context: ContextTypes.DEFAULT_TYPE):
-    """Daily 8:15 Asia/Dubai — push inbox if non-empty. Silent on empty days."""
+    """Daily 10:00 Asia/Dubai — push inbox if non-empty. Silent on empty days."""
     if not config.telegram_user_chat_id:
         logger.warning("TELEGRAM_USER_CHAT_ID not set — skipping morning digest")
         return
@@ -174,7 +174,7 @@ async def morning_inbox_digest(context: ContextTypes.DEFAULT_TYPE):
 
 
 async def test_morning_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Run the morning digest right now (for testing without waiting until 8:15)."""
+    """Run the morning digest right now (for testing without waiting until 10:00)."""
     if not config.telegram_user_chat_id:
         await update.message.reply_html(
             "⚠ Сначала добавь <code>TELEGRAM_USER_CHAT_ID</code> в Railway Variables.\n"
@@ -352,14 +352,14 @@ def main():
     )
     app.add_handler(CallbackQueryHandler(handle_callback))
 
-    # Schedule morning digest at 8:15 Asia/Dubai
+    # Schedule morning digest at 10:00 Asia/Dubai
     app.job_queue.run_daily(
         morning_inbox_digest,
-        time=dt_time(hour=8, minute=15, tzinfo=DUBAI_TZ),
+        time=dt_time(hour=10, minute=0, tzinfo=DUBAI_TZ),
         name="morning_inbox_digest",
     )
 
-    logger.info("Bot is running... morning digest scheduled at 8:15 Asia/Dubai")
+    logger.info("Bot is running... morning digest scheduled at 10:00 Asia/Dubai")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
