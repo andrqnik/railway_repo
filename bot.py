@@ -1,5 +1,7 @@
 import os
 import logging
+from datetime import time as dt_time, datetime
+from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -26,6 +28,8 @@ config = Config()
 ai_parser = AIParser(config.anthropic_api_key)
 clickup = ClickUpClient(config.clickup_api_key, config.clickup_list_id)
 
+DUBAI_TZ = ZoneInfo("Asia/Dubai")
+
 PRIORITY_LABELS = {
     1: "🔴 Срочный",
     2: "🟠 Высокий",
@@ -33,18 +37,63 @@ PRIORITY_LABELS = {
     4: "🔵 Низкий",
 }
 
+MONTHS_RU = ["января", "февраля", "марта", "апреля", "мая", "июня",
+             "июля", "августа", "сентября", "октября", "ноября", "декабря"]
+
+
+def _plural_tasks(n: int) -> str:
+    if n % 10 == 1 and n % 100 != 11:
+        return "задача"
+    elif 2 <= n % 10 <= 4 and not (12 <= n % 100 <= 14):
+        return "задачи"
+    else:
+        return "задач"
+
+
+def _format_date_short(dt: datetime) -> str:
+    return f"{dt.day} {MONTHS_RU[dt.month - 1]}"
+
+
+def _escape(text: str) -> str:
+    """Escape HTML special characters."""
+    return (
+        str(text)
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+    )
+
+
+def _format_inbox_list(tasks: list, header: str) -> str:
+    lines = [header]
+    for i, task in enumerate(tasks, 1):
+        name = task.get("name", "?")
+        url = task.get("url", "")
+        due = task.get("due_date")
+        due_str = ""
+        if due:
+            try:
+                due_dt = datetime.fromtimestamp(int(due) / 1000)
+                due_str = f" · 📅 {_format_date_short(due_dt)}"
+            except (ValueError, TypeError):
+                pass
+        if url:
+            line = f'{i}. <a href="{url}">{_escape(name)}</a>{due_str}'
+        else:
+            line = f'{i}. {_escape(name)}{due_str}'
+        lines.append(line)
+    return "\n".join(lines)
+
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_html(
         "👋 <b>Привет!</b> Я разбираю твои сообщения и помогаю с задачами в ClickUp.\n\n"
-        "Просто напиши задачу в свободной форме:\n"
-        "• <i>«Просмотреть презентацию до пятницы»</i>\n"
-        "• <i>«Позвонить клиенту Иванову до 15 марта»</i>\n"
-        "• <i>«Подготовить отчёт срочно — нужно добавить данные за Q1»</i>\n\n"
-        "Я разберу её и предложу два варианта:\n"
+        "Просто напиши задачу в свободной форме — я разберу и предложу:\n"
         "📥 <b>В инбокс</b> — отложить, разберём вместе утром\n"
         "✅ <b>Разобрать</b> — создать задачу прямо сейчас\n\n"
-        "Можно прикрепить файл — он добавится к задаче.\n\n"
+        "Каждое утро в 8:15 (Дубай) пришлю список того что в инбоксе.\n\n"
+        "<b>Команды:</b>\n"
+        "/inbox — показать инбокс прямо сейчас\n"
         "/help — подробная справка"
     )
 
@@ -56,14 +105,84 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "2. Я разберу — покажу превью с дедлайном и приоритетом\n"
         "3. Выбери: 📥 В инбокс (отложить) или ✅ Разобрать (создать сейчас)\n"
         "4. Можно прикрепить файл — попадёт в задачу\n\n"
-        "<b>Что делает каждая кнопка:</b>\n"
-        "• 📥 <b>В инбокс</b> → отложить, разберём вместе утром\n"
-        "• ✅ <b>Разобрать</b> → создать задачу сразу\n\n"
-        "<b>Примеры:</b>\n"
+        "<b>Команды:</b>\n"
+        "/inbox — показать что не разобрано\n"
+        "/myid — узнать свой chat_id (для настройки утренних дайджестов)\n"
+        "/test_morning — проверить утренний дайджест прямо сейчас\n\n"
+        "<b>Утренний дайджест:</b>\n"
+        "Каждый день в 8:15 по Дубаю присылаю список того что в инбоксе. "
+        "Если инбокс пустой — молчу.\n\n"
+        "<b>Примеры задач:</b>\n"
         "• <code>Подготовить договор с ООО Ромашка, дедлайн 25 марта, приоритет высокий</code>\n"
-        "• <code>Срочно позвонить в банк насчёт счёта</code>\n\n"
-        "<b>Файлы:</b> любые форматы (PDF, DOCX, PPTX, изображения)"
+        "• <code>Срочно позвонить в банк насчёт счёта</code>"
     )
+
+
+async def inbox_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show current inbox tasks on demand."""
+    msg = await update.message.reply_text("⏳ Забираю инбокс из ClickUp...")
+    try:
+        tasks = await clickup.get_inbox_tasks()
+        if not tasks:
+            await msg.edit_text("📭 Инбокс пуст. Чистый старт.")
+            return
+        n = len(tasks)
+        header = f"📥 <b>В инбоксе {n} {_plural_tasks(n)}:</b>\n"
+        text = _format_inbox_list(tasks, header)
+        await msg.edit_text(text, parse_mode="HTML", disable_web_page_preview=True)
+    except Exception as e:
+        logger.error(f"Inbox fetch error: {e}", exc_info=True)
+        await msg.edit_text(f"❌ Не удалось получить инбокс.\n\nОшибка: {str(e)}")
+
+
+async def myid_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Returns the user's chat_id — needed once to enable proactive morning digests."""
+    chat_id = update.effective_chat.id
+    await update.message.reply_html(
+        f"Твой <b>chat_id</b>: <code>{chat_id}</code>\n\n"
+        f"Чтобы включить утренние дайджесты:\n"
+        f"1. Зайди в Railway → Variables\n"
+        f"2. Добавь переменную <code>TELEGRAM_USER_CHAT_ID</code> со значением <code>{chat_id}</code>\n"
+        f"3. Railway автоматически перезапустит бота\n"
+        f"4. Проверь через /test_morning что работает"
+    )
+
+
+async def morning_inbox_digest(context: ContextTypes.DEFAULT_TYPE):
+    """Daily 8:15 Asia/Dubai — push inbox if non-empty. Silent on empty days."""
+    if not config.telegram_user_chat_id:
+        logger.warning("TELEGRAM_USER_CHAT_ID not set — skipping morning digest")
+        return
+    try:
+        tasks = await clickup.get_inbox_tasks()
+        if not tasks:
+            logger.info("Morning digest: inbox empty, staying silent")
+            return
+        n = len(tasks)
+        header = f"☀️ <b>Доброе утро.</b>\nВ инбоксе {n} {_plural_tasks(n)} — разберём?\n"
+        text = _format_inbox_list(tasks, header)
+        text += "\n\n<i>Открой ClickUp и пройди по списку. Или напиши /inbox чтобы посмотреть позже.</i>"
+        await context.bot.send_message(
+            chat_id=int(config.telegram_user_chat_id),
+            text=text,
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
+        logger.info(f"Morning digest sent: {n} tasks")
+    except Exception as e:
+        logger.error(f"Morning digest error: {e}", exc_info=True)
+
+
+async def test_morning_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Run the morning digest right now (for testing without waiting until 8:15)."""
+    if not config.telegram_user_chat_id:
+        await update.message.reply_html(
+            "⚠ Сначала добавь <code>TELEGRAM_USER_CHAT_ID</code> в Railway Variables.\n"
+            "Узнать свой chat_id: /myid"
+        )
+        return
+    await update.message.reply_text("🧪 Запускаю утренний дайджест прямо сейчас...")
+    await morning_inbox_digest(context)
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -80,10 +199,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     status_msg = await message.reply_text("⏳ Разбираю задачу...")
 
     try:
-        # Parse task via Claude AI
         task_data = await ai_parser.parse(text)
 
-        # Download file attachment if present
         file_content = None
         file_name = None
 
@@ -97,7 +214,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             file_content = bytes(await file.download_as_bytearray())
             file_name = f"photo_{photo.file_id}.jpg"
 
-        # Stash for the callback handler (in-memory; cleared on bot restart)
         cache_key = f"task_{message.message_id}"
         context.user_data[cache_key] = {
             "task_data": task_data,
@@ -105,7 +221,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "file_name": file_name,
         }
 
-        # Build preview message
         lines = ["📝 <b>Распознал:</b>\n"]
         lines.append(f"📌 <b>{_escape(task_data['name'])}</b>")
 
@@ -210,7 +325,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="HTML",
         )
 
-        # Clean up cache
         context.user_data.pop(cache_key, None)
 
     except Exception as e:
@@ -222,21 +336,14 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
-def _escape(text: str) -> str:
-    """Escape HTML special characters."""
-    return (
-        str(text)
-        .replace("&", "&amp;")
-        .replace("<", "&lt;")
-        .replace(">", "&gt;")
-    )
-
-
 def main():
     app = Application.builder().token(config.telegram_bot_token).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("inbox", inbox_command))
+    app.add_handler(CommandHandler("myid", myid_command))
+    app.add_handler(CommandHandler("test_morning", test_morning_command))
     app.add_handler(
         MessageHandler(
             (filters.TEXT | filters.Document.ALL | filters.PHOTO) & ~filters.COMMAND,
@@ -245,7 +352,14 @@ def main():
     )
     app.add_handler(CallbackQueryHandler(handle_callback))
 
-    logger.info("Bot is running...")
+    # Schedule morning digest at 8:15 Asia/Dubai
+    app.job_queue.run_daily(
+        morning_inbox_digest,
+        time=dt_time(hour=8, minute=15, tzinfo=DUBAI_TZ),
+        name="morning_inbox_digest",
+    )
+
+    logger.info("Bot is running... morning digest scheduled at 8:15 Asia/Dubai")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 

@@ -40,13 +40,11 @@ class ClickUpClient:
             payload["due_date_time"] = True
 
         if tags:
-            # ClickUp accepts tag names; tag must already exist in the Space.
             payload["tags"] = tags
 
         async with aiohttp.ClientSession() as session:
             task = await self._create_task_request(session, payload)
 
-            # Upload file attachment if provided (best-effort: don't fail if attach errors)
             if file_content and file_name and task.get("id"):
                 try:
                     await self._upload_attachment(session, task["id"], file_content, file_name)
@@ -54,6 +52,27 @@ class ClickUpClient:
                     logger.warning(f"File attachment failed (task was still created): {e}")
 
         return task
+
+    async def get_inbox_tasks(self, include_closed: bool = False) -> list:
+        """Fetch open tasks from the inbox list. Returns list of task dicts."""
+        url = f"{self.BASE_URL}/list/{self.list_id}/task"
+        params = {"archived": "false"}
+        if include_closed:
+            params["include_closed"] = "true"
+
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, headers=self._json_headers, params=params) as resp:
+                response_text = await resp.text()
+                if resp.status != 200:
+                    logger.error(f"ClickUp get tasks error {resp.status}: {response_text}")
+                    if resp.status == 401:
+                        raise Exception("Неверный ClickUp API ключ (401).")
+                    elif resp.status == 404:
+                        raise Exception("Inbox-список не найден (404). Проверь CLICKUP_LIST_ID.")
+                    else:
+                        raise Exception(f"Ошибка ClickUp API ({resp.status}): {response_text[:200]}")
+                data = await resp.json()
+                return data.get("tasks", [])
 
     async def _create_task_request(self, session: aiohttp.ClientSession, payload: dict) -> dict:
         url = f"{self.BASE_URL}/list/{self.list_id}/task"
@@ -81,7 +100,7 @@ class ClickUpClient:
         file_name: str,
     ):
         url = f"{self.BASE_URL}/task/{task_id}/attachment"
-        headers = {"Authorization": self.api_key}  # No Content-Type — multipart
+        headers = {"Authorization": self.api_key}
 
         form = aiohttp.FormData()
         form.add_field(
