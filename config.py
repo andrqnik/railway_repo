@@ -17,6 +17,12 @@ class Config:
         # Optional — voice transcription via Whisper
         self.openai_api_key = os.environ.get("OPENAI_API_KEY", "")
 
+        # Optional — Step 4 multi-target picker.
+        # Comma-separated folder IDs the bot is ALLOWED to read/write within the Space.
+        # If empty, the picker is disabled and "Разобрать" creates in the default
+        # CLICKUP_LIST_ID (Inbox), preserving Step 1-3 behavior.
+        self.clickup_allowed_folder_ids = os.environ.get("CLICKUP_ALLOWED_FOLDER_IDS", "")
+
         missing = [
             name
             for name, value in [
@@ -33,3 +39,8 @@ class Config:
                 f"Missing required environment variables: {', '.join(missing)}\n"
                 f"Please set them in your .env file or Railway Variables."
             )
+
+    @property
+    def allowed_folder_id_list(self) -> list:
+        """Parsed list of folder IDs from CLICKUP_ALLOWED_FOLDER_IDS env var."""
+        return [x.strip() for x in self.clickup_allowed_folder_ids.split(",") if x.strip()]

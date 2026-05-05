@@ -26,8 +26,10 @@ class ClickUpClient:
         file_content: bytes = None,
         file_name: str = None,
         tags: list = None,
+        list_id: str = None,
     ) -> dict:
-        """Create a task in ClickUp, optionally with tags and an attached file."""
+        """Create a task. If list_id is given, creates there; else uses default (inbox)."""
+        target_list = list_id or self.list_id
         payload = {
             "name": task_data["name"],
             "description": task_data.get("description", ""),
@@ -43,7 +45,7 @@ class ClickUpClient:
             payload["tags"] = tags
 
         async with aiohttp.ClientSession() as session:
-            task = await self._create_task_request(session, payload)
+            task = await self._create_task_request(session, target_list, payload)
 
             if file_content and file_name and task.get("id"):
                 try:
@@ -74,19 +76,90 @@ class ClickUpClient:
                 data = await resp.json()
                 return data.get("tasks", [])
 
-    async def _create_task_request(self, session: aiohttp.ClientSession, payload: dict) -> dict:
-        url = f"{self.BASE_URL}/list/{self.list_id}/task"
+    async def get_allowed_targets(
+        self,
+        allowed_folder_ids: list,
+        exclude_list_ids: list = None,
+    ) -> dict:
+        """Fetch ONLY whitelisted folders + their non-archived lists.
+
+        Returns:
+            {
+                "folders": [
+                    {
+                        "id": "...",
+                        "name": "UAE",
+                        "lists": [
+                            {"id": "...", "name": "Dubai", "task_count": 21},
+                            ...
+                        ]
+                    },
+                    ...
+                ]
+            }
+
+        Each folder requires one GET /folder/{id} call. Folders that fail to
+        fetch are skipped with a warning (no exception raised).
+        """
+        exclude = set(exclude_list_ids or [])
+        folders = []
+
+        async with aiohttp.ClientSession() as session:
+            for folder_id in allowed_folder_ids:
+                url = f"{self.BASE_URL}/folder/{folder_id}"
+                try:
+                    async with session.get(url, headers=self._json_headers) as resp:
+                        if resp.status != 200:
+                            response_text = await resp.text()
+                            logger.warning(
+                                f"Folder {folder_id} fetch failed ({resp.status}): "
+                                f"{response_text[:120]}; skipping"
+                            )
+                            continue
+                        data = await resp.json()
+                except Exception as e:
+                    logger.warning(f"Folder {folder_id} fetch exception: {e}; skipping")
+                    continue
+
+                folder_name = data.get("name", "?")
+                lists = []
+                for lst in data.get("lists", []):
+                    if lst.get("archived"):
+                        continue
+                    list_id = lst.get("id")
+                    if not list_id or list_id in exclude:
+                        continue
+                    lists.append({
+                        "id": list_id,
+                        "name": lst.get("name", "?"),
+                        "task_count": lst.get("task_count", 0),
+                    })
+
+                folders.append({
+                    "id": folder_id,
+                    "name": folder_name,
+                    "lists": lists,
+                })
+
+        return {"folders": folders}
+
+    async def _create_task_request(
+        self,
+        session: aiohttp.ClientSession,
+        list_id: str,
+        payload: dict,
+    ) -> dict:
+        url = f"{self.BASE_URL}/list/{list_id}/task"
 
         async with session.post(url, headers=self._json_headers, json=payload) as resp:
             response_text = await resp.text()
 
             if resp.status not in (200, 201):
-                logger.error(f"ClickUp create task error {resp.status}: {response_text}")
-
+                logger.error(f"ClickUp create task error {resp.status} (list {list_id}): {response_text}")
                 if resp.status == 401:
-                    raise Exception("Неверный ClickUp API ключ (401 Unauthorized). Проверьте CLICKUP_API_KEY.")
+                    raise Exception("Неверный ClickUp API ключ (401 Unauthorized).")
                 elif resp.status == 404:
-                    raise Exception("Список ClickUp не найден (404). Проверьте CLICKUP_LIST_ID.")
+                    raise Exception(f"Список ClickUp не найден (404, list_id={list_id}).")
                 else:
                     raise Exception(f"Ошибка ClickUp API ({resp.status}): {response_text[:200]}")
 
