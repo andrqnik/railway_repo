@@ -1,7 +1,7 @@
 import os
 import time
 import logging
-from datetime import time as dt_time, datetime
+from datetime import time as dt_time, datetime, timedelta
 from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -223,8 +223,12 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/test_morning — проверить утренний дайджест прямо сейчас\n\n"
         "<b>Утренний дайджест в 10:00 (Дубай):</b>\n"
         "• 📅 Сегодня запланировано — задачи с дедлайном на сегодня по всем твоим папкам\n"
-        "• 📥 В инбоксе — то что не разобрано\n"
-        "• Если оба пустые — молчу"
+        "• 📥 В инбоксе — то что не разобрано (с 🎯 кнопками для быстрого разбора)\n"
+        "• Если оба пустые — молчу\n\n"
+        "<b>Вечерний нудёж в 19:00 (Дубай):</b>\n"
+        "Если в инбоксе есть задачи старше 3 дней — один пинг с 🎯 кнопками. "
+        "Если ничего не застряло — молчу.\n\n"
+        "Команды для теста расписаний: /test_morning, /test_stale"
     )
 
 
@@ -367,6 +371,83 @@ async def test_morning_command(update: Update, context: ContextTypes.DEFAULT_TYP
         return
     await update.message.reply_text("🧪 Запускаю утренний дайджест прямо сейчас...")
     await morning_inbox_digest(context)
+
+
+
+async def stale_inbox_nudge(context: ContextTypes.DEFAULT_TYPE):
+    """Daily 19:00 Asia/Dubai — nudge about inbox tasks older than 3 days.
+
+    Stays silent if nothing is stale. One message regardless of how many
+    stale tasks (avoids spamming on busy days).
+    """
+    if not config.telegram_user_chat_id:
+        logger.warning("TELEGRAM_USER_CHAT_ID not set — skipping stale nudge")
+        return
+
+    try:
+        tasks = await clickup.get_inbox_tasks()
+    except Exception as e:
+        logger.error(f"Stale nudge fetch error: {e}", exc_info=True)
+        return
+
+    if not tasks:
+        return
+
+    # Tasks older than 3 days based on date_created (ClickUp returns string ms timestamp)
+    threshold = datetime.now(DUBAI_TZ) - timedelta(days=3)
+    threshold_ms = int(threshold.timestamp() * 1000)
+
+    stale = []
+    for t in tasks:
+        try:
+            created_ms = int(t.get("date_created", 0))
+        except (ValueError, TypeError):
+            continue
+        if created_ms and created_ms < threshold_ms:
+            stale.append(t)
+
+    if not stale:
+        logger.info("Stale nudge: nothing stale, staying silent")
+        return
+
+    n = len(stale)
+    header = f"⏳ <b>В инбоксе {n} {_plural_tasks(n)} висит больше 3 дней:</b>\n"
+    text = _format_inbox_list(stale, header)
+    text += "\n\n<i>Посмотрим? Тапни 🎯 чтобы разобрать.</i>"
+
+    rows = []
+    pair = []
+    for i, task in enumerate(stale, 1):
+        pair.append(InlineKeyboardButton(
+            f"🎯 #{i}",
+            callback_data=f"proc:{task['id']}",
+        ))
+        if len(pair) == 3:
+            rows.append(pair)
+            pair = []
+    if pair:
+        rows.append(pair)
+
+    await context.bot.send_message(
+        chat_id=int(config.telegram_user_chat_id),
+        text=text,
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+        reply_markup=InlineKeyboardMarkup(rows) if rows else None,
+    )
+    logger.info(f"Stale nudge sent: {n} tasks older than 3 days")
+
+
+async def test_stale_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Run stale nudge right now (for testing without waiting until 19:00)."""
+    if not config.telegram_user_chat_id:
+        await update.message.reply_html(
+            "⚠ Сначала добавь <code>TELEGRAM_USER_CHAT_ID</code> в Railway Variables.\n"
+            "Узнать chat_id: /myid"
+        )
+        return
+    await update.message.reply_text("🧪 Запускаю проверку застрявших задач прямо сейчас...")
+    await stale_inbox_nudge(context)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1020,6 +1101,7 @@ def main():
     app.add_handler(CommandHandler("inbox", inbox_command))
     app.add_handler(CommandHandler("myid", myid_command))
     app.add_handler(CommandHandler("test_morning", test_morning_command))
+    app.add_handler(CommandHandler("test_stale", test_stale_command))
 
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice))
     app.add_handler(
@@ -1036,10 +1118,16 @@ def main():
         name="morning_inbox_digest",
     )
 
+    app.job_queue.run_daily(
+        stale_inbox_nudge,
+        time=dt_time(hour=19, minute=0, tzinfo=DUBAI_TZ),
+        name="stale_inbox_nudge",
+    )
+
     voice_status = "ON" if whisper else "OFF"
     targets_status = f"ON ({len(config.allowed_folder_id_list)} folders)" if config.allowed_folder_id_list else "OFF"
     logger.info(
-        f"Bot is running... morning digest at 10:00 Asia/Dubai · "
+        f"Bot is running... morning digest 10:00 + stale nudge 19:00 (Asia/Dubai) · "
         f"voice: {voice_status} · target picker: {targets_status}"
     )
     app.run_polling(allowed_updates=Update.ALL_TYPES)
