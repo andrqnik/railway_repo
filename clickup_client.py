@@ -190,6 +190,27 @@ class ClickUpClient:
 
         return all_tasks
 
+    async def get_task(self, task_id: str) -> dict:
+        """Fetch full task data by id."""
+        url = f"{self.BASE_URL}/task/{task_id}"
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, headers=self._json_headers) as resp:
+                response_text = await resp.text()
+                if resp.status != 200:
+                    logger.error(f"ClickUp get_task error {resp.status}: {response_text}")
+                    raise Exception(f"Не удалось получить задачу ({resp.status}): {response_text[:200]}")
+                return await resp.json()
+
+    async def delete_task(self, task_id: str) -> None:
+        """Delete a task by id."""
+        url = f"{self.BASE_URL}/task/{task_id}"
+        async with aiohttp.ClientSession() as session:
+            async with session.delete(url, headers=self._json_headers) as resp:
+                if resp.status not in (200, 204):
+                    response_text = await resp.text()
+                    logger.error(f"ClickUp delete_task error {resp.status}: {response_text}")
+                    raise Exception(f"Не удалось удалить задачу ({resp.status}): {response_text[:200]}")
+
     async def _create_task_request(
         self,
         session: aiohttp.ClientSession,

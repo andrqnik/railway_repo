@@ -238,7 +238,27 @@ async def inbox_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         n = len(tasks)
         header = f"📥 <b>В инбоксе {n} {_plural_tasks(n)}:</b>\n"
         text = _format_inbox_list(tasks, header)
-        await msg.edit_text(text, parse_mode="HTML", disable_web_page_preview=True)
+
+        # 🎯 buttons — one per task (3 per row)
+        rows = []
+        pair = []
+        for i, task in enumerate(tasks, 1):
+            pair.append(InlineKeyboardButton(
+                f"🎯 #{i}",
+                callback_data=f"proc:{task['id']}",
+            ))
+            if len(pair) == 3:
+                rows.append(pair)
+                pair = []
+        if pair:
+            rows.append(pair)
+
+        await msg.edit_text(
+            text,
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+            reply_markup=InlineKeyboardMarkup(rows) if rows else None,
+        )
     except Exception as e:
         logger.error(f"Inbox fetch error: {e}", exc_info=True)
         await msg.edit_text(f"❌ Не удалось получить инбокс.\n\nОшибка: {str(e)}")
@@ -312,11 +332,28 @@ async def morning_inbox_digest(context: ContextTypes.DEFAULT_TYPE):
     sections.append("\n<i>Открой ClickUp и пройди по списку. Или напиши /inbox чтобы посмотреть позже.</i>")
 
     text = "\n".join(sections)
+
+    # 🎯 buttons — only for inbox tasks (today tasks are informational, no action)
+    rows = []
+    if inbox_tasks:
+        pair = []
+        for i, task in enumerate(inbox_tasks, 1):
+            pair.append(InlineKeyboardButton(
+                f"🎯 #{i}",
+                callback_data=f"proc:{task['id']}",
+            ))
+            if len(pair) == 3:
+                rows.append(pair)
+                pair = []
+        if pair:
+            rows.append(pair)
+
     await context.bot.send_message(
         chat_id=int(config.telegram_user_chat_id),
         text=text,
         parse_mode="HTML",
         disable_web_page_preview=True,
+        reply_markup=InlineKeyboardMarkup(rows) if rows else None,
     )
     logger.info(f"Morning digest sent: {len(today_tasks)} today, {len(inbox_tasks)} inbox")
 
@@ -481,6 +518,19 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await _show_folder_picker(query, context, parts[1])
         elif action == "c":
             await _restore_initial(query, context, parts[1])
+        # Inbox processing flow (Step 7)
+        elif action == "proc":
+            await _start_proc(query, context, parts[1])
+        elif action == "pf":
+            await _show_proc_list_picker(query, context, folder_id=parts[1], task_id=parts[2])
+        elif action == "pl":
+            await _move_task(query, context, list_id=parts[1], task_id=parts[2])
+        elif action == "pb":
+            await _start_proc(query, context, parts[1])
+        elif action == "pc":
+            await query.edit_message_text(
+                "⚠ Отменено. Используй /inbox чтобы продолжить разбор."
+            )
         else:
             await query.edit_message_text("⚠ Неизвестное действие.")
     except IndexError:
@@ -726,6 +776,240 @@ async def _send_creation_confirmation(query, cached, task, header):
     if task_url:
         lines.append(f'\n<a href="{task_url}">🔗 Открыть в ClickUp</a>')
     await query.edit_message_text("\n".join(lines), parse_mode="HTML")
+
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Inbox processing flow (Step 7) — turn an existing inbox task into a target
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def _start_proc(query, context, task_id):
+    """Begin processing an existing inbox task. Loads, classifies, shows picker."""
+    if not config.allowed_folder_id_list:
+        await query.edit_message_text(
+            "⚠ Multi-target picker не настроен. Добавь CLICKUP_ALLOWED_FOLDER_IDS в Railway."
+        )
+        return
+
+    await query.edit_message_text("🤖 Загружаю задачу и думаю куда положить...")
+
+    try:
+        clickup_task = await clickup.get_task(task_id)
+    except Exception as e:
+        logger.error(f"get_task error: {e}", exc_info=True)
+        await query.edit_message_text(f"❌ Не удалось загрузить задачу: {e}")
+        return
+
+    current_list_id = clickup_task.get("list", {}).get("id")
+    if current_list_id != config.clickup_list_id:
+        logger.warning(
+            f"BLOCKED proc: task {task_id} not in inbox-list (current: {current_list_id})"
+        )
+        await query.edit_message_text(
+            "⚠ Эта задача уже не в инбоксе — возможно её уже разобрали или закрыли.\n"
+            "Используй /inbox чтобы увидеть актуальное."
+        )
+        return
+
+    task_data = {
+        "name": clickup_task.get("name", ""),
+        "description": clickup_task.get("description", "") or "",
+    }
+
+    cache_key = f"proc_{task_id}"
+    context.user_data[cache_key] = {
+        "task_data": task_data,
+        "clickup_task": clickup_task,
+    }
+
+    try:
+        targets = await _get_targets()
+    except Exception as e:
+        logger.error(f"Targets fetch error: {e}", exc_info=True)
+        await query.edit_message_text(f"❌ Не удалось получить структуру папок: {e}")
+        return
+
+    folders = targets.get("folders", [])
+    if not folders:
+        await query.edit_message_text("⚠ Не удалось получить папки.")
+        return
+
+    suggestion = None
+    try:
+        suggestion = await ai_parser.classify_target(task_data, targets)
+    except Exception as e:
+        logger.warning(f"AI classify (proc) exception: {e}")
+
+    text_lines = [f"📌 <b>{_escape(task_data['name'])}</b>"]
+    rows = []
+
+    if suggestion and suggestion.get("list_id") and suggestion.get("confidence") in ("high", "medium"):
+        sug_folder = suggestion.get("folder_name", "?")
+        sug_list = suggestion.get("list_name", "?")
+        sug_reasoning = suggestion.get("reasoning", "")
+        if sug_reasoning:
+            text_lines.append(f"\n🤖 <i>{_escape(sug_reasoning)}</i>")
+        rows.append([InlineKeyboardButton(
+            f"⭐ {sug_folder} → {sug_list}",
+            callback_data=f"pl:{suggestion['list_id']}:{task_id}",
+        )])
+        text_lines.append("\n<i>Или выбрать вручную:</i>")
+    else:
+        text_lines.append("\n<i>Куда переместить?</i>")
+
+    pair = []
+    for folder in folders:
+        pair.append(InlineKeyboardButton(
+            f"📁 {folder['name']}",
+            callback_data=f"pf:{folder['id']}:{task_id}",
+        ))
+        if len(pair) == 2:
+            rows.append(pair)
+            pair = []
+    if pair:
+        rows.append(pair)
+    rows.append([InlineKeyboardButton("⬅ Отмена", callback_data=f"pc:{task_id}")])
+
+    await query.edit_message_text(
+        "\n".join(text_lines),
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(rows),
+    )
+
+
+async def _show_proc_list_picker(query, context, folder_id, task_id):
+    cache_key = f"proc_{task_id}"
+    cached = context.user_data.get(cache_key)
+    if not cached:
+        await query.edit_message_text("⚠ Сессия истекла. Запусти /inbox заново.")
+        return
+
+    targets = await _get_targets()
+    folder = next((f for f in targets.get("folders", []) if f["id"] == folder_id), None)
+    if not folder:
+        await query.edit_message_text("⚠ Папка не в whitelist.")
+        return
+
+    if not folder["lists"]:
+        await _start_proc(query, context, task_id)
+        return
+
+    task_data = cached["task_data"]
+    text_lines = [
+        f"📌 <b>{_escape(task_data['name'])}</b>",
+        f"\n📁 <b>{_escape(folder['name'])}</b> → выбери список:",
+    ]
+
+    rows = []
+    for lst in folder["lists"]:
+        count = lst.get("task_count", 0)
+        label = lst["name"]
+        if count:
+            label += f" ({count})"
+        rows.append([InlineKeyboardButton(
+            label,
+            callback_data=f"pl:{lst['id']}:{task_id}",
+        )])
+    rows.append([
+        InlineKeyboardButton("⬅ Назад", callback_data=f"pb:{task_id}"),
+        InlineKeyboardButton("⬅ Отмена", callback_data=f"pc:{task_id}"),
+    ])
+
+    await query.edit_message_text(
+        "\n".join(text_lines),
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(rows),
+    )
+
+
+async def _move_task(query, context, list_id, task_id):
+    cache_key = f"proc_{task_id}"
+    cached = context.user_data.get(cache_key)
+    if not cached:
+        await query.edit_message_text("⚠ Сессия истекла. Запусти /inbox заново.")
+        return
+
+    targets = await _get_targets()
+    allowed = _allowed_list_ids(targets)
+    if list_id not in allowed:
+        logger.error(f"BLOCKED proc-move: target list_id={list_id} not in whitelist")
+        await query.edit_message_text(
+            "❌ Этот список не в whitelist. Перенос отменён.\n"
+            "Это защита от случайных операций в чужих папках."
+        )
+        return
+
+    target_folder = None
+    target_list = None
+    for f in targets["folders"]:
+        for lst in f["lists"]:
+            if lst["id"] == list_id:
+                target_folder = f
+                target_list = lst
+                break
+        if target_list:
+            break
+
+    await query.edit_message_text("⏳ Переношу задачу...")
+
+    try:
+        clickup_task = cached["clickup_task"]
+
+        priority_obj = clickup_task.get("priority")
+        priority_int = 3
+        if isinstance(priority_obj, dict):
+            try:
+                priority_int = int(priority_obj.get("id", 3))
+            except (ValueError, TypeError):
+                pass
+
+        new_task_data = {
+            "name": clickup_task.get("name", ""),
+            "description": clickup_task.get("description", "") or "",
+            "priority": priority_int,
+        }
+        if clickup_task.get("due_date"):
+            new_task_data["due_date"] = int(clickup_task["due_date"])
+
+        new_task = await clickup.create_task(
+            task_data=new_task_data,
+            list_id=list_id,
+        )
+
+        attachments_lost = bool(clickup_task.get("attachments"))
+        try:
+            await clickup.delete_task(task_id)
+        except Exception as e:
+            logger.error(f"Delete-after-move failed for task {task_id}: {e}")
+            orig_url = clickup_task.get("url", "")
+            await query.edit_message_text(
+                f"⚠ Создал в {_escape(target_folder['name'])} → {_escape(target_list['name'])}, "
+                f"но не смог удалить оригинал из инбокса. Удали его вручную:\n"
+                f'<a href="{orig_url}">оригинал</a>',
+                parse_mode="HTML",
+            )
+            context.user_data.pop(cache_key, None)
+            return
+
+        location = (
+            f"{target_folder['name']} → {target_list['name']}"
+            if target_folder and target_list else
+            "указанный список"
+        )
+
+        lines = [f"✅ <b>Перенёс в {_escape(location)}.</b>\n"]
+        lines.append(f"📌 <b>{_escape(new_task_data['name'])}</b>")
+        if attachments_lost:
+            lines.append("\n⚠ <i>Вложения не перенесены — ClickUp API не поддерживает копирование между списками. Если нужны — открой оригинал и перетащи вручную.</i>")
+        new_url = new_task.get("url", "")
+        if new_url:
+            lines.append(f'\n<a href="{new_url}">🔗 Открыть в ClickUp</a>')
+
+        await query.edit_message_text("\n".join(lines), parse_mode="HTML")
+        context.user_data.pop(cache_key, None)
+    except Exception as e:
+        logger.error(f"Move task error: {e}", exc_info=True)
+        await query.edit_message_text(f"❌ Не удалось перенести: {e}")
 
 
 def main():
