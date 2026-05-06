@@ -1,7 +1,20 @@
 import logging
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+
 import aiohttp
 
 logger = logging.getLogger(__name__)
+
+DUBAI_TZ = ZoneInfo("Asia/Dubai")
+
+
+def _today_dubai_range_ms() -> tuple:
+    """Returns (start_ms, end_ms) for today in Dubai TZ as inclusive UTC ms timestamps."""
+    now = datetime.now(DUBAI_TZ)
+    start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    end = start + timedelta(days=1) - timedelta(milliseconds=1)
+    return int(start.timestamp() * 1000), int(end.timestamp() * 1000)
 
 
 class ClickUpClient:
@@ -56,7 +69,7 @@ class ClickUpClient:
         return task
 
     async def get_inbox_tasks(self, include_closed: bool = False) -> list:
-        """Fetch open tasks from the inbox list. Returns list of task dicts."""
+        """Fetch open tasks from the inbox list."""
         url = f"{self.BASE_URL}/list/{self.list_id}/task"
         params = {"archived": "false"}
         if include_closed:
@@ -81,26 +94,7 @@ class ClickUpClient:
         allowed_folder_ids: list,
         exclude_list_ids: list = None,
     ) -> dict:
-        """Fetch ONLY whitelisted folders + their non-archived lists.
-
-        Returns:
-            {
-                "folders": [
-                    {
-                        "id": "...",
-                        "name": "UAE",
-                        "lists": [
-                            {"id": "...", "name": "Dubai", "task_count": 21},
-                            ...
-                        ]
-                    },
-                    ...
-                ]
-            }
-
-        Each folder requires one GET /folder/{id} call. Folders that fail to
-        fetch are skipped with a warning (no exception raised).
-        """
+        """Fetch ONLY whitelisted folders + their non-archived lists."""
         exclude = set(exclude_list_ids or [])
         folders = []
 
@@ -142,6 +136,59 @@ class ClickUpClient:
                 })
 
         return {"folders": folders}
+
+    async def get_tasks_due_today(
+        self,
+        allowed_folder_ids: list,
+        exclude_list_ids: list = None,
+    ) -> list:
+        """Fetch open tasks due today across all whitelisted lists.
+
+        Per-list iteration — each call is hard-scoped to a single list_id from
+        the whitelist. Cannot leak into other teams' folders by construction.
+
+        Returns flat list of tasks with extra '_folder_name' and '_list_name'
+        keys for display purposes.
+        """
+        targets = await self.get_allowed_targets(allowed_folder_ids, exclude_list_ids)
+
+        start_ms, end_ms = _today_dubai_range_ms()
+        # Use exclusive bounds with -1/+1 trick so midnight and 23:59:59.999 are inclusive
+        gt = str(start_ms - 1)
+        lt = str(end_ms + 1)
+
+        all_tasks = []
+
+        async with aiohttp.ClientSession() as session:
+            for folder in targets["folders"]:
+                for lst in folder["lists"]:
+                    url = f"{self.BASE_URL}/list/{lst['id']}/task"
+                    params = {
+                        "due_date_gt": gt,
+                        "due_date_lt": lt,
+                        "include_closed": "false",
+                        "archived": "false",
+                    }
+                    try:
+                        async with session.get(url, headers=self._json_headers, params=params) as resp:
+                            if resp.status != 200:
+                                response_text = await resp.text()
+                                logger.warning(
+                                    f"List {lst['id']} ({folder['name']}/{lst['name']}) "
+                                    f"due-today fetch failed ({resp.status}): {response_text[:120]}"
+                                )
+                                continue
+                            data = await resp.json()
+                    except Exception as e:
+                        logger.warning(f"List {lst['id']} due-today fetch exception: {e}")
+                        continue
+
+                    for task in data.get("tasks", []):
+                        task["_folder_name"] = folder["name"]
+                        task["_list_name"] = lst["name"]
+                        all_tasks.append(task)
+
+        return all_tasks
 
     async def _create_task_request(
         self,

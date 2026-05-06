@@ -39,6 +39,7 @@ PRIORITY_LABELS = {
     3: "🟡 Обычный",
     4: "🔵 Низкий",
 }
+PRIORITY_EMOJI = {1: "🔴", 2: "🟠", 3: "🟡", 4: "🔵"}
 
 MONTHS_RU = ["января", "февраля", "марта", "апреля", "мая", "июня",
              "июля", "августа", "сентября", "октября", "ноября", "декабря"]
@@ -74,24 +75,51 @@ def _truncate(text: str, limit: int = 200) -> str:
     return text if len(text) <= limit else text[:limit] + "..."
 
 
+def _priority_emoji(task: dict) -> str:
+    """Extract priority emoji from ClickUp task object (priority is nested dict)."""
+    p = task.get("priority")
+    if isinstance(p, dict):
+        try:
+            return PRIORITY_EMOJI.get(int(p.get("id", 3)), "⚪")
+        except (ValueError, TypeError):
+            return "⚪"
+    return "⚪"
+
+
+def _format_inbox_task_line(i: int, task: dict) -> str:
+    """Single-line formatter for inbox tasks."""
+    name = task.get("name", "?")
+    url = task.get("url", "")
+    due = task.get("due_date")
+    due_str = ""
+    if due:
+        try:
+            due_dt = datetime.fromtimestamp(int(due) / 1000)
+            due_str = f" · 📅 {_format_date_short(due_dt)}"
+        except (ValueError, TypeError):
+            pass
+    if url:
+        return f'{i}. <a href="{url}">{_escape(name)}</a>{due_str}'
+    return f'{i}. {_escape(name)}{due_str}'
+
+
+def _format_today_task_line(i: int, task: dict) -> str:
+    """Single-line formatter for today's scheduled tasks (with folder/list path)."""
+    name = task.get("name", "?")
+    url = task.get("url", "")
+    folder = task.get("_folder_name", "?")
+    list_name = task.get("_list_name", "?")
+    emoji = _priority_emoji(task)
+    location = f"[{_escape(folder)} → {_escape(list_name)}]"
+    if url:
+        return f'{i}. {emoji} <a href="{url}">{_escape(name)}</a> · <i>{location}</i>'
+    return f'{i}. {emoji} {_escape(name)} · <i>{location}</i>'
+
+
 def _format_inbox_list(tasks: list, header: str) -> str:
-    lines = [header]
+    lines = [header] if header else []
     for i, task in enumerate(tasks, 1):
-        name = task.get("name", "?")
-        url = task.get("url", "")
-        due = task.get("due_date")
-        due_str = ""
-        if due:
-            try:
-                due_dt = datetime.fromtimestamp(int(due) / 1000)
-                due_str = f" · 📅 {_format_date_short(due_dt)}"
-            except (ValueError, TypeError):
-                pass
-        if url:
-            line = f'{i}. <a href="{url}">{_escape(name)}</a>{due_str}'
-        else:
-            line = f'{i}. {_escape(name)}{due_str}'
-        lines.append(line)
+        lines.append(_format_inbox_task_line(i, task))
     return "\n".join(lines)
 
 
@@ -102,8 +130,7 @@ def _format_inbox_list(tasks: list, header: str) -> str:
 async def _get_targets() -> dict:
     """Returns {"folders": [...]} from cache or fresh fetch.
 
-    Hard-scoped to CLICKUP_ALLOWED_FOLDER_IDS only. The Inbox list
-    (CLICKUP_LIST_ID) is always excluded from targets.
+    Hard-scoped to CLICKUP_ALLOWED_FOLDER_IDS only. Inbox excluded.
     """
     now = time.time()
     if _targets_cache["data"] and now < _targets_cache["expires_at"]:
@@ -132,7 +159,6 @@ def _allowed_list_ids(targets: dict) -> set:
 
 
 def _build_preview_lines(task_data: dict, file_name: str = None, voice_transcript: str = None) -> list:
-    """Build preview text lines (used for initial preview AND cancel-back-to-preview)."""
     lines = []
     if voice_transcript:
         lines.append(f"🎙 <i>«{_escape(_truncate(voice_transcript))}»</i>\n")
@@ -170,7 +196,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Напиши задачу текстом, пришли голосовое или прикрепи файл — я разберу и предложу:\n"
         "📥 <b>В инбокс</b> — отложить, разберём вместе утром\n"
         "✅ <b>Разобрать</b> — выбрать папку и список прямо сейчас\n\n"
-        "Каждое утро в 10:00 (Дубай) пришлю список того что в инбоксе.\n\n"
+        "Каждое утро в 10:00 (Дубай) пришлю что запланировано на сегодня + что висит в инбоксе.\n\n"
         "<b>Команды:</b>\n"
         "/inbox — показать инбокс прямо сейчас\n"
         "/help — подробная справка"
@@ -195,9 +221,10 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/inbox — показать что не разобрано\n"
         "/myid — узнать chat_id (для утренних дайджестов)\n"
         "/test_morning — проверить утренний дайджест прямо сейчас\n\n"
-        "<b>Утренний дайджест:</b>\n"
-        "Каждый день в 10:00 по Дубаю присылаю список того что в инбоксе. "
-        "Если инбокс пустой — молчу."
+        "<b>Утренний дайджест в 10:00 (Дубай):</b>\n"
+        "• 📅 Сегодня запланировано — задачи с дедлайном на сегодня по всем твоим папкам\n"
+        "• 📥 В инбоксе — то что не разобрано\n"
+        "• Если оба пустые — молчу"
     )
 
 
@@ -227,27 +254,71 @@ async def myid_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def morning_inbox_digest(context: ContextTypes.DEFAULT_TYPE):
+    """Daily 10:00 Asia/Dubai — sends today's scheduled + inbox if non-empty.
+
+    Two sections:
+      📅 Сегодня запланировано — tasks across all whitelisted folders due today
+      📥 В инбоксе — current inbox-list contents
+
+    Stays silent if both are empty.
+    """
     if not config.telegram_user_chat_id:
         logger.warning("TELEGRAM_USER_CHAT_ID not set — skipping morning digest")
         return
+
+    today_tasks = []
+    inbox_tasks = []
+
     try:
-        tasks = await clickup.get_inbox_tasks()
-        if not tasks:
-            logger.info("Morning digest: inbox empty, staying silent")
-            return
-        n = len(tasks)
-        header = f"☀️ <b>Доброе утро.</b>\nВ инбоксе {n} {_plural_tasks(n)} — разберём?\n"
-        text = _format_inbox_list(tasks, header)
-        text += "\n\n<i>Открой ClickUp и пройди по списку. Или напиши /inbox чтобы посмотреть позже.</i>"
-        await context.bot.send_message(
-            chat_id=int(config.telegram_user_chat_id),
-            text=text,
-            parse_mode="HTML",
-            disable_web_page_preview=True,
-        )
-        logger.info(f"Morning digest sent: {n} tasks")
+        if config.allowed_folder_id_list:
+            today_tasks = await clickup.get_tasks_due_today(
+                config.allowed_folder_id_list,
+                exclude_list_ids=[config.clickup_list_id],
+            )
+        inbox_tasks = await clickup.get_inbox_tasks()
     except Exception as e:
-        logger.error(f"Morning digest error: {e}", exc_info=True)
+        logger.error(f"Morning digest fetch error: {e}", exc_info=True)
+        return
+
+    if not today_tasks and not inbox_tasks:
+        logger.info("Morning digest: nothing today, inbox empty — staying silent")
+        return
+
+    sections = ["☀️ <b>Доброе утро.</b>"]
+
+    if today_tasks:
+        # Sort by priority (1=urgent first), then by due_date asc
+        def _priority_id(t):
+            p = t.get("priority")
+            if isinstance(p, dict):
+                try:
+                    return int(p.get("id", 3))
+                except (ValueError, TypeError):
+                    return 3
+            return 3
+
+        today_tasks.sort(key=lambda t: (_priority_id(t), int(t.get("due_date") or 0)))
+        n = len(today_tasks)
+        sections.append(f"\n📅 <b>Сегодня запланировано ({n}):</b>")
+        for i, task in enumerate(today_tasks, 1):
+            sections.append(_format_today_task_line(i, task))
+
+    if inbox_tasks:
+        n = len(inbox_tasks)
+        sections.append(f"\n📥 <b>В инбоксе ({n} {_plural_tasks(n)}) — разберём?</b>")
+        for i, task in enumerate(inbox_tasks, 1):
+            sections.append(_format_inbox_task_line(i, task))
+
+    sections.append("\n<i>Открой ClickUp и пройди по списку. Или напиши /inbox чтобы посмотреть позже.</i>")
+
+    text = "\n".join(sections)
+    await context.bot.send_message(
+        chat_id=int(config.telegram_user_chat_id),
+        text=text,
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+    )
+    logger.info(f"Morning digest sent: {len(today_tasks)} today, {len(inbox_tasks)} inbox")
 
 
 async def test_morning_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -262,7 +333,7 @@ async def test_morning_command(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Capture pipeline (text + voice → preview with buttons)
+# Capture pipeline
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def _show_task_preview(
@@ -295,7 +366,6 @@ async def _show_task_preview(
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Text messages with optional document/photo attachment."""
     message = update.message
     text = message.text or message.caption or ""
 
@@ -385,7 +455,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Callback dispatcher (defer / now / folder picker / list picker / back / cancel)
+# Callback dispatcher
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -449,7 +519,6 @@ async def _show_folder_picker(query, context, msg_id):
         await query.edit_message_text("⚠ Данные потерялись. Пришли задачу ещё раз.")
         return
 
-    # Fall back to legacy "create in inbox" behavior if whitelist not set
     if not config.allowed_folder_id_list:
         await query.edit_message_text("⏳ Создаю задачу...")
         try:
@@ -465,7 +534,6 @@ async def _show_folder_picker(query, context, msg_id):
             await query.edit_message_text(f"❌ Не удалось создать: {str(e)}")
         return
 
-    # Whitelist active — show folder picker
     try:
         targets = await _get_targets()
     except Exception as e:
@@ -521,7 +589,6 @@ async def _show_list_picker(query, context, folder_id, msg_id):
         return
 
     if not folder["lists"]:
-        # Folder is empty — re-show folder picker so user picks again
         await _show_folder_picker(query, context, msg_id)
         return
 
@@ -560,7 +627,6 @@ async def _create_in_target(query, context, list_id, msg_id):
         await query.edit_message_text("⚠ Данные потерялись. Пришли задачу ещё раз.")
         return
 
-    # HARD GUARD — verify list_id is in whitelist before any API call
     targets = await _get_targets()
     allowed = _allowed_list_ids(targets)
     if list_id not in allowed:
@@ -571,7 +637,6 @@ async def _create_in_target(query, context, list_id, msg_id):
         )
         return
 
-    # Find folder/list names for the confirmation message
     target_folder = None
     target_list = None
     for f in targets["folders"]:
@@ -606,7 +671,6 @@ async def _create_in_target(query, context, list_id, msg_id):
 
 
 async def _restore_initial(query, context, msg_id):
-    """User cancelled picker — restore original preview with [📥/✅] buttons."""
     cache_key = f"task_{msg_id}"
     cached = context.user_data.get(cache_key)
     if not cached:
@@ -626,7 +690,6 @@ async def _restore_initial(query, context, msg_id):
 
 
 async def _send_creation_confirmation(query, cached, task, header):
-    """Format and send the post-creation confirmation message."""
     task_data = cached["task_data"]
     lines = [header]
     lines.append(f"📌 <b>{_escape(task_data['name'])}</b>")
@@ -641,8 +704,6 @@ async def _send_creation_confirmation(query, cached, task, header):
         lines.append(f'\n<a href="{task_url}">🔗 Открыть в ClickUp</a>')
     await query.edit_message_text("\n".join(lines), parse_mode="HTML")
 
-
-# ─────────────────────────────────────────────────────────────────────────────
 
 def main():
     app = Application.builder().token(config.telegram_bot_token).build()
@@ -669,7 +730,7 @@ def main():
     )
 
     voice_status = "ON" if whisper else "OFF"
-    targets_status = f"ON ({len(config.allowed_folder_id_list)} folders)" if config.allowed_folder_id_list else "OFF (fallback to inbox)"
+    targets_status = f"ON ({len(config.allowed_folder_id_list)} folders)" if config.allowed_folder_id_list else "OFF"
     logger.info(
         f"Bot is running... morning digest at 10:00 Asia/Dubai · "
         f"voice: {voice_status} · target picker: {targets_status}"
