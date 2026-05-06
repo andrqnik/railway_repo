@@ -534,6 +534,9 @@ async def _show_folder_picker(query, context, msg_id):
             await query.edit_message_text(f"❌ Не удалось создать: {str(e)}")
         return
 
+    # Show "thinking" while we fetch + classify
+    await query.edit_message_text("🤖 Думаю куда положить...")
+
     try:
         targets = await _get_targets()
     except Exception as e:
@@ -548,13 +551,33 @@ async def _show_folder_picker(query, context, msg_id):
         )
         return
 
+    # Try AI classification (best effort — picker still works if it fails)
+    suggestion = None
+    try:
+        suggestion = await ai_parser.classify_target(cached["task_data"], targets)
+    except Exception as e:
+        logger.warning(f"AI classify exception: {e}")
+
     task_data = cached["task_data"]
-    text = (
-        f"📌 <b>{_escape(task_data['name'])}</b>\n\n"
-        f"<i>Куда положить?</i>"
-    )
+    text_lines = [f"📌 <b>{_escape(task_data['name'])}</b>"]
 
     rows = []
+
+    # ⭐ Suggested target — only if confidence is high or medium
+    if suggestion and suggestion.get("list_id") and suggestion.get("confidence") in ("high", "medium"):
+        sug_folder = suggestion.get("folder_name", "?")
+        sug_list = suggestion.get("list_name", "?")
+        sug_reasoning = suggestion.get("reasoning", "")
+        if sug_reasoning:
+            text_lines.append(f"\n🤖 <i>{_escape(sug_reasoning)}</i>")
+        rows.append([InlineKeyboardButton(
+            f"⭐ {sug_folder} → {sug_list}",
+            callback_data=f"l:{suggestion['list_id']}:{msg_id}",
+        )])
+        text_lines.append("\n<i>Или выбрать вручную:</i>")
+    else:
+        text_lines.append("\n<i>Куда положить?</i>")
+
     pair = []
     for folder in folders:
         pair.append(InlineKeyboardButton(
@@ -569,7 +592,7 @@ async def _show_folder_picker(query, context, msg_id):
     rows.append([InlineKeyboardButton("⬅ Отмена", callback_data=f"c:{msg_id}")])
 
     await query.edit_message_text(
-        text,
+        "\n".join(text_lines),
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(rows),
     )
